@@ -23,6 +23,8 @@
 
 #include <map>
 #include <mutex>
+#include <string>
+#include <strings.h>
 
 #include <media/hardware/HardwareAPI.h>
 
@@ -76,6 +78,7 @@ typedef OMX_ERRORTYPE (*ParameterFunc)(
         OMX_HANDLETYPE, OMX_INDEXTYPE, OMX_PTR);
 
 struct Watched {
+    std::string name;
     ParameterFunc getParameter;
     ParameterFunc setParameter;
 
@@ -86,6 +89,16 @@ struct Watched {
 
 std::mutex gWatchedLock;
 std::map<OMX_COMPONENTTYPE *, Watched> gWatched;
+
+bool isAvcComponent(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gWatchedLock);
+
+    std::map<OMX_COMPONENTTYPE *, Watched>::const_iterator it =
+            gWatched.find(component);
+
+    return it != gWatched.end()
+            && strcasestr(it->second.name.c_str(), "h264") != NULL;
+}
 
 ParameterFunc originalGetParameter(OMX_COMPONENTTYPE *component) {
     std::lock_guard<std::mutex> lock(gWatchedLock);
@@ -183,22 +196,42 @@ OMX_ERRORTYPE WatchedGetParameter(
     OMX_ERRORTYPE err = (*original)(hComponent, nIndex, pParam);
 
     /*
-     * What the component says it can decode, because the framework believes
-     * it over anything media_codecs.xml declares. MediaCodecList derives a
-     * maximum frame size from the level and intersects it with the XML
-     * limits, so the smaller wins: a component topping out at level 3.0 is
-     * held to 1620 macroblocks whatever the XML says, which passes 640x360
-     * at 900 and refuses 1280x720 at 3600. A decoder filtered out that way
-     * never reaches the caller at all, and software is what is left.
+     * How large a frame the framework will let this decoder have.
+     *
+     * MediaCodecList takes the levels a component advertises, works a maximum
+     * frame size out of them, and intersects that with whatever
+     * media_codecs.xml declares -- the smaller of the two wins, so the XML
+     * cannot lift a level that is set too low. A decoder ruled out that way is
+     * never offered to the caller at all: at 640x360 the browser uses this one
+     * and plays, and the moment the quality goes up it drops it without trying
+     * and takes c2.android.avc.decoder, which then fails outright.
+     *
+     * The part is capable of more than it says. The chip's own manual has it
+     * at "full motion playback of up to 1440P high-definition video", and
+     * 2560x1440 is 14400 macroblocks -- past level 4.2, which allows 8704 and
+     * therefore stops at 1080p, and inside level 5, which allows 22080. So
+     * level 5 is what is reported, and the XML limits of 3840x2176 and 783360
+     * blocks a second stay the real ceiling, since they are the smaller.
+     *
+     * Only the level is touched, and only for this codec. The profiles are
+     * left exactly as the component lists them, and the original is written
+     * down beside the change.
      */
     if (err == OMX_ErrorNone
             && nIndex == OMX_IndexParamVideoProfileLevelQuerySupported
             && pParam != NULL) {
-        const OMX_VIDEO_PARAM_PROFILELEVELTYPE *pl =
-                static_cast<const OMX_VIDEO_PARAM_PROFILELEVELTYPE *>(pParam);
+        OMX_VIDEO_PARAM_PROFILELEVELTYPE *pl =
+                static_cast<OMX_VIDEO_PARAM_PROFILELEVELTYPE *>(pParam);
 
-        ALOGE("advertises port %u entry %u: profile 0x%x level 0x%x",
-              pl->nPortIndex, pl->nProfileIndex, pl->eProfile, pl->eLevel);
+        if (isAvcComponent(component) && pl->eLevel < OMX_VIDEO_AVCLevel5) {
+            ALOGI("port %u entry %u: profile 0x%x level 0x%x, raised to 0x%x",
+                  pl->nPortIndex, pl->nProfileIndex, pl->eProfile, pl->eLevel,
+                  OMX_VIDEO_AVCLevel5);
+            pl->eLevel = OMX_VIDEO_AVCLevel5;
+        } else {
+            ALOGI("port %u entry %u: profile 0x%x level 0x%x, left alone",
+                  pl->nPortIndex, pl->nProfileIndex, pl->eProfile, pl->eLevel);
+        }
     }
 
     if (err != OMX_ErrorNone
@@ -274,7 +307,7 @@ OMX_ERRORTYPE WatchedSetParameter(
     return err;
 }
 
-void watchComponent(OMX_COMPONENTTYPE *component) {
+void watchComponent(OMX_COMPONENTTYPE *component, const char *name) {
     if (component == NULL
             || component->GetParameter == NULL
             || component->SetParameter == NULL) {
@@ -284,6 +317,7 @@ void watchComponent(OMX_COMPONENTTYPE *component) {
     std::lock_guard<std::mutex> lock(gWatchedLock);
 
     Watched &watched = gWatched[component];
+    watched.name = name == NULL ? "" : name;
     watched.getParameter = component->GetParameter;
     watched.setParameter = component->SetParameter;
     watched.reportedMin.clear();
@@ -366,7 +400,7 @@ OMX_ERRORTYPE NVOMXPlugin::makeComponentInstance(
             appData, const_cast<OMX_CALLBACKTYPE *>(callbacks));
 
     if (err == OMX_ErrorNone) {
-        watchComponent(*component);
+        watchComponent(*component, name);
     }
 
     if (!strncmp(name, "OMX.Nvidia.drm.play", strlen("OMX.Nvidia.drm.play")))

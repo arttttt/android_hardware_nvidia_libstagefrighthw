@@ -33,52 +33,114 @@ namespace android {
 namespace {
 
 /*
- * What the component was asked for, when it says no.
+ * The component's own answer, corrected in the one place it will not take it
+ * back.
  *
- * ACodec can only report its own reading of a refusal. Asked to set the
- * output port's buffer count, it hands back the port definition the component
- * gave it with one field changed, and if that comes back
- * OMX_ErrorUnsupportedSetting it says "setting nBufferCountActual to 19
- * failed" -- which is a description of the request, not of the objection. On
- * this board every count it offers is refused, the port disable that follows
- * times out, and libnvomx then dereferences null and takes media.codec with
- * it, so what the component actually objected to is worth knowing exactly.
+ * Its output port accepts a buffer count in a window of three: the minimum it
+ * reports, and two above. Measured on this board, that is thirteen to fifteen
+ * -- sixteen, seventeen, eighteen and nineteen are each refused with
+ * OMX_ErrorUnsupportedSetting, and fifteen is taken.
  *
- * The plugin is where it can be seen. It hands the raw OMX_COMPONENTTYPE out
- * of makeComponentInstance, function pointers and all, so SetParameter can be
- * replaced by one that forwards and, on a refusal, writes down the structure
- * as it was sent. Nothing is altered on the way through.
+ * ACodec cannot reach it. It offers nBufferCountMin plus what the window holds
+ * undequeued plus three, two, one and none, so the lowest it will ever offer
+ * is min plus undequeued. A SurfaceView holds two, which lands exactly on
+ * fifteen and plays. An ImageReader with two images holds three, which lands
+ * on sixteen and never fits, whatever the resolution or the stream -- one
+ * buffer short, every time. That is every attempt to play video in a browser:
+ * the count is refused, the port disable that follows times out, and libnvomx
+ * then dereferences null and takes media.codec with it.
+ *
+ * Nothing raises the ceiling. The blob carries two hundred and thirty-four
+ * vendor indices and not one of them names a maximum buffer count; the ones
+ * that touch buffers at all lower what is asked for rather than raise what is
+ * allowed. And lowering it would not help: the window moves whole, so the
+ * offer stays one above the top of it.
+ *
+ * What is left is the number ACodec starts its arithmetic from. Reporting one
+ * less minimum puts its lowest offer on fifteen, which the component takes --
+ * not an invented figure but the top of its own range, and the same count the
+ * SurfaceView path already runs on.
+ *
+ * It has to be done on both sides. The component checks the minimum it is
+ * handed for equality against its own, not as a bound, so a lowered figure
+ * coming back would be refused for a second reason. It is therefore lowered on
+ * the way out and put back on the way in, and the component is given exactly
+ * what it reported.
  *
  * The originals are kept beside the component rather than in it:
  * pComponentPrivate belongs to the component, and a plugin has no business
  * there.
  */
 
-typedef OMX_ERRORTYPE (*SetParameterFunc)(
+typedef OMX_ERRORTYPE (*ParameterFunc)(
         OMX_HANDLETYPE, OMX_INDEXTYPE, OMX_PTR);
 
-std::mutex gOriginalsLock;
-std::map<OMX_COMPONENTTYPE *, SetParameterFunc> gOriginalSetParameter;
+struct Watched {
+    ParameterFunc getParameter;
+    ParameterFunc setParameter;
 
-std::map<OMX_COMPONENTTYPE *, bool> gProbed;
+    /* Per port, the minimum as the component reported it, before one was
+     * taken off for the caller. */
+    std::map<OMX_U32, OMX_U32> reportedMin;
+};
 
-bool probedAlready(OMX_COMPONENTTYPE *component) {
-    std::lock_guard<std::mutex> lock(gOriginalsLock);
+std::mutex gWatchedLock;
+std::map<OMX_COMPONENTTYPE *, Watched> gWatched;
 
-    if (gProbed[component]) {
-        return true;
-    }
-    gProbed[component] = true;
-    return false;
+ParameterFunc originalGetParameter(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gWatchedLock);
+
+    std::map<OMX_COMPONENTTYPE *, Watched>::const_iterator it =
+            gWatched.find(component);
+
+    return it == gWatched.end() ? NULL : it->second.getParameter;
 }
 
-SetParameterFunc originalSetParameter(OMX_COMPONENTTYPE *component) {
-    std::lock_guard<std::mutex> lock(gOriginalsLock);
+ParameterFunc originalSetParameter(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gWatchedLock);
 
-    std::map<OMX_COMPONENTTYPE *, SetParameterFunc>::const_iterator it =
-            gOriginalSetParameter.find(component);
+    std::map<OMX_COMPONENTTYPE *, Watched>::const_iterator it =
+            gWatched.find(component);
 
-    return it == gOriginalSetParameter.end() ? NULL : it->second;
+    return it == gWatched.end() ? NULL : it->second.setParameter;
+}
+
+void rememberReportedMin(
+        OMX_COMPONENTTYPE *component, OMX_U32 port, OMX_U32 min) {
+    std::lock_guard<std::mutex> lock(gWatchedLock);
+
+    std::map<OMX_COMPONENTTYPE *, Watched>::iterator it =
+            gWatched.find(component);
+
+    if (it != gWatched.end()) {
+        it->second.reportedMin[port] = min;
+    }
+}
+
+bool reportedMin(
+        OMX_COMPONENTTYPE *component, OMX_U32 port, OMX_U32 *min) {
+    std::lock_guard<std::mutex> lock(gWatchedLock);
+
+    std::map<OMX_COMPONENTTYPE *, Watched>::const_iterator it =
+            gWatched.find(component);
+
+    if (it == gWatched.end()) {
+        return false;
+    }
+
+    std::map<OMX_U32, OMX_U32>::const_iterator port_it =
+            it->second.reportedMin.find(port);
+
+    if (port_it == it->second.reportedMin.end()) {
+        return false;
+    }
+
+    *min = port_it->second;
+    return true;
+}
+
+bool isVideoOutputPort(const OMX_PARAM_PORTDEFINITIONTYPE *def) {
+    return def->eDomain == OMX_PortDomainVideo && def->eDir == OMX_DirOutput;
 }
 
 void reportRefusedPortDefinition(
@@ -95,7 +157,7 @@ void reportRefusedPortDefinition(
     ALOGE("port definition refused with 0x%08x: port %u %s, "
           "buffers actual %u min %u align %u size %u, "
           "%ux%u stride %d slice %u, colour 0x%x compression 0x%x, "
-          "bitrate %u framerate 0x%x, enabled %d populated %d tunneled %d",
+          "enabled %d populated %d",
           err, def->nPortIndex,
           def->eDir == OMX_DirInput ? "in" : "out",
           def->nBufferCountActual, def->nBufferCountMin, def->nBufferAlignment,
@@ -103,56 +165,41 @@ void reportRefusedPortDefinition(
           def->format.video.nFrameWidth, def->format.video.nFrameHeight,
           def->format.video.nStride, def->format.video.nSliceHeight,
           def->format.video.eColorFormat, def->format.video.eCompressionFormat,
-          def->format.video.nBitrate, def->format.video.xFramerate,
-          def->bEnabled, def->bPopulated, def->bBuffersContiguous);
+          def->bEnabled, def->bPopulated);
 }
 
-/*
- * Which buffer counts the component will take, when it has just refused one.
- *
- * Everything in the structure except nBufferCountActual is the component's own
- * answer handed straight back, so a refusal is either about the count or about
- * a field it reports happily and validates on the way in. ACodec cannot tell
- * the difference and never asks below nBufferCountMin plus what the window
- * holds undequeued, so the range underneath has never been tried.
- *
- * Here it is. The sweep runs downwards from one below what was refused to the
- * component's own minimum, and stops at the first value taken. Nothing is
- * accepted on the caller's behalf: the original refusal is what goes back, and
- * this only writes down what would have worked. A sweep that finds nothing
- * says the count was never the objection.
- */
-void probeAcceptedBufferCount(
-        SetParameterFunc original, OMX_HANDLETYPE hComponent,
-        const OMX_PARAM_PORTDEFINITIONTYPE *refused) {
-    if (refused->nBufferCountActual <= refused->nBufferCountMin) {
-        ALOGE("  nothing below to try: refused %u is already the minimum",
-              refused->nBufferCountActual);
-        return;
+OMX_ERRORTYPE WatchedGetParameter(
+        OMX_HANDLETYPE hComponent, OMX_INDEXTYPE nIndex, OMX_PTR pParam) {
+    OMX_COMPONENTTYPE *component =
+            static_cast<OMX_COMPONENTTYPE *>(hComponent);
+
+    ParameterFunc original = originalGetParameter(component);
+
+    if (original == NULL) {
+        ALOGE("GetParameter on a component this plugin does not know");
+        return OMX_ErrorInvalidComponent;
     }
 
-    for (OMX_U32 count = refused->nBufferCountActual - 1;
-         count >= refused->nBufferCountMin; --count) {
-        OMX_PARAM_PORTDEFINITIONTYPE attempt = *refused;
-        attempt.nBufferCountActual = count;
+    OMX_ERRORTYPE err = (*original)(hComponent, nIndex, pParam);
 
-        OMX_ERRORTYPE err = (*original)(
-                hComponent, OMX_IndexParamPortDefinition, &attempt);
-
-        if (err == OMX_ErrorNone) {
-            ALOGE("  but %u is taken, so the count is what it objects to", count);
-            return;
-        }
-
-        /* Guard the unsigned wrap: nBufferCountMin can be zero. */
-        if (count == refused->nBufferCountMin) {
-            break;
-        }
+    if (err != OMX_ErrorNone
+            || nIndex != OMX_IndexParamPortDefinition || pParam == NULL) {
+        return err;
     }
 
-    ALOGE("  and nothing from %u down to %u is taken either, so the count is "
-          "not what it objects to",
-          refused->nBufferCountActual - 1, refused->nBufferCountMin);
+    OMX_PARAM_PORTDEFINITIONTYPE *def =
+            static_cast<OMX_PARAM_PORTDEFINITIONTYPE *>(pParam);
+
+    /* A minimum of one cannot be lowered without saying something absurd, and
+     * a port that small was never the problem. */
+    if (!isVideoOutputPort(def) || def->nBufferCountMin < 2) {
+        return err;
+    }
+
+    rememberReportedMin(component, def->nPortIndex, def->nBufferCountMin);
+    def->nBufferCountMin--;
+
+    return err;
 }
 
 OMX_ERRORTYPE WatchedSetParameter(
@@ -160,13 +207,36 @@ OMX_ERRORTYPE WatchedSetParameter(
     OMX_COMPONENTTYPE *component =
             static_cast<OMX_COMPONENTTYPE *>(hComponent);
 
-    SetParameterFunc original = originalSetParameter(component);
+    ParameterFunc original = originalSetParameter(component);
 
     /* Nothing sensible to forward to. Saying so is better than pretending the
      * setting was taken. */
     if (original == NULL) {
         ALOGE("SetParameter on a component this plugin does not know");
         return OMX_ErrorInvalidComponent;
+    }
+
+    if (nIndex == OMX_IndexParamPortDefinition && pParam != NULL) {
+        const OMX_PARAM_PORTDEFINITIONTYPE *def =
+                static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam);
+
+        OMX_U32 reported = 0;
+
+        if (isVideoOutputPort(def)
+                && reportedMin(component, def->nPortIndex, &reported)
+                && def->nBufferCountMin != reported) {
+            /* Give the component back the figure it gave us. The caller keeps
+             * the one it was told, which is what its arithmetic was built on. */
+            OMX_PARAM_PORTDEFINITIONTYPE restored = *def;
+            restored.nBufferCountMin = reported;
+
+            OMX_ERRORTYPE err = (*original)(hComponent, nIndex, &restored);
+
+            if (err != OMX_ErrorNone) {
+                reportRefusedPortDefinition(err, &restored);
+            }
+            return err;
+        }
     }
 
     OMX_ERRORTYPE err = (*original)(hComponent, nIndex, pParam);
@@ -176,19 +246,8 @@ OMX_ERRORTYPE WatchedSetParameter(
     }
 
     if (nIndex == OMX_IndexParamPortDefinition && pParam != NULL) {
-        const OMX_PARAM_PORTDEFINITIONTYPE *def =
-                static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam);
-
-        reportRefusedPortDefinition(err, def);
-
-        /* Only once per component, and only for the port that matters: the
-         * sweep leaves the component holding whatever it accepted, which is
-         * fine in a run that is failing anyway but not worth repeating four
-         * times over. */
-        if (def->eDomain == OMX_PortDomainVideo && def->eDir == OMX_DirOutput
-                && !probedAlready(component)) {
-            probeAcceptedBufferCount(original, hComponent, def);
-        }
+        reportRefusedPortDefinition(
+                err, static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam));
     } else {
         ALOGE("SetParameter(0x%08x) refused with 0x%08x", nIndex, err);
     }
@@ -197,30 +256,38 @@ OMX_ERRORTYPE WatchedSetParameter(
 }
 
 void watchComponent(OMX_COMPONENTTYPE *component) {
-    if (component == NULL || component->SetParameter == NULL) {
+    if (component == NULL
+            || component->GetParameter == NULL
+            || component->SetParameter == NULL) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(gOriginalsLock);
+    std::lock_guard<std::mutex> lock(gWatchedLock);
 
-    gOriginalSetParameter[component] = component->SetParameter;
+    Watched &watched = gWatched[component];
+    watched.getParameter = component->GetParameter;
+    watched.setParameter = component->SetParameter;
+    watched.reportedMin.clear();
+
+    component->GetParameter = WatchedGetParameter;
     component->SetParameter = WatchedSetParameter;
 }
 
 void forgetComponent(OMX_COMPONENTTYPE *component) {
-    std::lock_guard<std::mutex> lock(gOriginalsLock);
+    std::lock_guard<std::mutex> lock(gWatchedLock);
 
-    std::map<OMX_COMPONENTTYPE *, SetParameterFunc>::iterator it =
-            gOriginalSetParameter.find(component);
+    std::map<OMX_COMPONENTTYPE *, Watched>::iterator it =
+            gWatched.find(component);
 
-    if (it == gOriginalSetParameter.end()) {
+    if (it == gWatched.end()) {
         return;
     }
 
     /* Put the component back as it was before handing it to be freed. */
-    component->SetParameter = it->second;
-    gOriginalSetParameter.erase(it);
-    gProbed.erase(component);
+    component->GetParameter = it->second.getParameter;
+    component->SetParameter = it->second.setParameter;
+
+    gWatched.erase(it);
 }
 
 }  // namespace

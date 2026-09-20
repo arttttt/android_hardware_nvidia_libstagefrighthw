@@ -60,6 +60,18 @@ typedef OMX_ERRORTYPE (*SetParameterFunc)(
 std::mutex gOriginalsLock;
 std::map<OMX_COMPONENTTYPE *, SetParameterFunc> gOriginalSetParameter;
 
+std::map<OMX_COMPONENTTYPE *, bool> gProbed;
+
+bool probedAlready(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gOriginalsLock);
+
+    if (gProbed[component]) {
+        return true;
+    }
+    gProbed[component] = true;
+    return false;
+}
+
 SetParameterFunc originalSetParameter(OMX_COMPONENTTYPE *component) {
     std::lock_guard<std::mutex> lock(gOriginalsLock);
 
@@ -95,6 +107,54 @@ void reportRefusedPortDefinition(
           def->bEnabled, def->bPopulated, def->bBuffersContiguous);
 }
 
+/*
+ * Which buffer counts the component will take, when it has just refused one.
+ *
+ * Everything in the structure except nBufferCountActual is the component's own
+ * answer handed straight back, so a refusal is either about the count or about
+ * a field it reports happily and validates on the way in. ACodec cannot tell
+ * the difference and never asks below nBufferCountMin plus what the window
+ * holds undequeued, so the range underneath has never been tried.
+ *
+ * Here it is. The sweep runs downwards from one below what was refused to the
+ * component's own minimum, and stops at the first value taken. Nothing is
+ * accepted on the caller's behalf: the original refusal is what goes back, and
+ * this only writes down what would have worked. A sweep that finds nothing
+ * says the count was never the objection.
+ */
+void probeAcceptedBufferCount(
+        SetParameterFunc original, OMX_HANDLETYPE hComponent,
+        const OMX_PARAM_PORTDEFINITIONTYPE *refused) {
+    if (refused->nBufferCountActual <= refused->nBufferCountMin) {
+        ALOGE("  nothing below to try: refused %u is already the minimum",
+              refused->nBufferCountActual);
+        return;
+    }
+
+    for (OMX_U32 count = refused->nBufferCountActual - 1;
+         count >= refused->nBufferCountMin; --count) {
+        OMX_PARAM_PORTDEFINITIONTYPE attempt = *refused;
+        attempt.nBufferCountActual = count;
+
+        OMX_ERRORTYPE err = (*original)(
+                hComponent, OMX_IndexParamPortDefinition, &attempt);
+
+        if (err == OMX_ErrorNone) {
+            ALOGE("  but %u is taken, so the count is what it objects to", count);
+            return;
+        }
+
+        /* Guard the unsigned wrap: nBufferCountMin can be zero. */
+        if (count == refused->nBufferCountMin) {
+            break;
+        }
+    }
+
+    ALOGE("  and nothing from %u down to %u is taken either, so the count is "
+          "not what it objects to",
+          refused->nBufferCountActual - 1, refused->nBufferCountMin);
+}
+
 OMX_ERRORTYPE WatchedSetParameter(
         OMX_HANDLETYPE hComponent, OMX_INDEXTYPE nIndex, OMX_PTR pParam) {
     OMX_COMPONENTTYPE *component =
@@ -116,8 +176,19 @@ OMX_ERRORTYPE WatchedSetParameter(
     }
 
     if (nIndex == OMX_IndexParamPortDefinition && pParam != NULL) {
-        reportRefusedPortDefinition(
-                err, static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam));
+        const OMX_PARAM_PORTDEFINITIONTYPE *def =
+                static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam);
+
+        reportRefusedPortDefinition(err, def);
+
+        /* Only once per component, and only for the port that matters: the
+         * sweep leaves the component holding whatever it accepted, which is
+         * fine in a run that is failing anyway but not worth repeating four
+         * times over. */
+        if (def->eDomain == OMX_PortDomainVideo && def->eDir == OMX_DirOutput
+                && !probedAlready(component)) {
+            probeAcceptedBufferCount(original, hComponent, def);
+        }
     } else {
         ALOGE("SetParameter(0x%08x) refused with 0x%08x", nIndex, err);
     }
@@ -149,6 +220,7 @@ void forgetComponent(OMX_COMPONENTTYPE *component) {
     /* Put the component back as it was before handing it to be freed. */
     component->SetParameter = it->second;
     gOriginalSetParameter.erase(it);
+    gProbed.erase(component);
 }
 
 }  // namespace

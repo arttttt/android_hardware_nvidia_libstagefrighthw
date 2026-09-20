@@ -21,11 +21,137 @@
 #include "omxplugin.h"
 #include <dlfcn.h>
 
+#include <map>
+#include <mutex>
+
 #include <media/hardware/HardwareAPI.h>
 
 OMX_COMPONENTTYPE * gOMXDrmPlayComponent = 0;
 
 namespace android {
+
+namespace {
+
+/*
+ * What the component was asked for, when it says no.
+ *
+ * ACodec can only report its own reading of a refusal. Asked to set the
+ * output port's buffer count, it hands back the port definition the component
+ * gave it with one field changed, and if that comes back
+ * OMX_ErrorUnsupportedSetting it says "setting nBufferCountActual to 19
+ * failed" -- which is a description of the request, not of the objection. On
+ * this board every count it offers is refused, the port disable that follows
+ * times out, and libnvomx then dereferences null and takes media.codec with
+ * it, so what the component actually objected to is worth knowing exactly.
+ *
+ * The plugin is where it can be seen. It hands the raw OMX_COMPONENTTYPE out
+ * of makeComponentInstance, function pointers and all, so SetParameter can be
+ * replaced by one that forwards and, on a refusal, writes down the structure
+ * as it was sent. Nothing is altered on the way through.
+ *
+ * The originals are kept beside the component rather than in it:
+ * pComponentPrivate belongs to the component, and a plugin has no business
+ * there.
+ */
+
+typedef OMX_ERRORTYPE (*SetParameterFunc)(
+        OMX_HANDLETYPE, OMX_INDEXTYPE, OMX_PTR);
+
+std::mutex gOriginalsLock;
+std::map<OMX_COMPONENTTYPE *, SetParameterFunc> gOriginalSetParameter;
+
+SetParameterFunc originalSetParameter(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gOriginalsLock);
+
+    std::map<OMX_COMPONENTTYPE *, SetParameterFunc>::const_iterator it =
+            gOriginalSetParameter.find(component);
+
+    return it == gOriginalSetParameter.end() ? NULL : it->second;
+}
+
+void reportRefusedPortDefinition(
+        OMX_ERRORTYPE err, const OMX_PARAM_PORTDEFINITIONTYPE *def) {
+    if (def->eDomain != OMX_PortDomainVideo) {
+        ALOGE("port definition refused with 0x%08x: port %u, domain %d, "
+              "buffers actual %u min %u size %u, enabled %d populated %d",
+              err, def->nPortIndex, def->eDomain, def->nBufferCountActual,
+              def->nBufferCountMin, def->nBufferSize,
+              def->bEnabled, def->bPopulated);
+        return;
+    }
+
+    ALOGE("port definition refused with 0x%08x: port %u %s, "
+          "buffers actual %u min %u align %u size %u, "
+          "%ux%u stride %d slice %u, colour 0x%x compression 0x%x, "
+          "bitrate %u framerate 0x%x, enabled %d populated %d tunneled %d",
+          err, def->nPortIndex,
+          def->eDir == OMX_DirInput ? "in" : "out",
+          def->nBufferCountActual, def->nBufferCountMin, def->nBufferAlignment,
+          def->nBufferSize,
+          def->format.video.nFrameWidth, def->format.video.nFrameHeight,
+          def->format.video.nStride, def->format.video.nSliceHeight,
+          def->format.video.eColorFormat, def->format.video.eCompressionFormat,
+          def->format.video.nBitrate, def->format.video.xFramerate,
+          def->bEnabled, def->bPopulated, def->bBuffersContiguous);
+}
+
+OMX_ERRORTYPE WatchedSetParameter(
+        OMX_HANDLETYPE hComponent, OMX_INDEXTYPE nIndex, OMX_PTR pParam) {
+    OMX_COMPONENTTYPE *component =
+            static_cast<OMX_COMPONENTTYPE *>(hComponent);
+
+    SetParameterFunc original = originalSetParameter(component);
+
+    /* Nothing sensible to forward to. Saying so is better than pretending the
+     * setting was taken. */
+    if (original == NULL) {
+        ALOGE("SetParameter on a component this plugin does not know");
+        return OMX_ErrorInvalidComponent;
+    }
+
+    OMX_ERRORTYPE err = (*original)(hComponent, nIndex, pParam);
+
+    if (err == OMX_ErrorNone) {
+        return err;
+    }
+
+    if (nIndex == OMX_IndexParamPortDefinition && pParam != NULL) {
+        reportRefusedPortDefinition(
+                err, static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam));
+    } else {
+        ALOGE("SetParameter(0x%08x) refused with 0x%08x", nIndex, err);
+    }
+
+    return err;
+}
+
+void watchComponent(OMX_COMPONENTTYPE *component) {
+    if (component == NULL || component->SetParameter == NULL) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(gOriginalsLock);
+
+    gOriginalSetParameter[component] = component->SetParameter;
+    component->SetParameter = WatchedSetParameter;
+}
+
+void forgetComponent(OMX_COMPONENTTYPE *component) {
+    std::lock_guard<std::mutex> lock(gOriginalsLock);
+
+    std::map<OMX_COMPONENTTYPE *, SetParameterFunc>::iterator it =
+            gOriginalSetParameter.find(component);
+
+    if (it == gOriginalSetParameter.end()) {
+        return;
+    }
+
+    /* Put the component back as it was before handing it to be freed. */
+    component->SetParameter = it->second;
+    gOriginalSetParameter.erase(it);
+}
+
+}  // namespace
 
 OMXPluginBase *createOMXPlugin() {
     return new NVOMXPlugin;
@@ -81,6 +207,10 @@ OMX_ERRORTYPE NVOMXPlugin::makeComponentInstance(
             const_cast<char *>(name),
             appData, const_cast<OMX_CALLBACKTYPE *>(callbacks));
 
+    if (err == OMX_ErrorNone) {
+        watchComponent(*component);
+    }
+
     if (!strncmp(name, "OMX.Nvidia.drm.play", strlen("OMX.Nvidia.drm.play")))
     {
         gOMXDrmPlayComponent = *component;
@@ -99,6 +229,8 @@ OMX_ERRORTYPE NVOMXPlugin::destroyComponentInstance(
     {
         gOMXDrmPlayComponent = 0;
     }
+
+    forgetComponent(component);
 
     return (*mFreeHandle)(reinterpret_cast<OMX_HANDLETYPE *>(component));
 }

@@ -182,6 +182,25 @@ OMX_ERRORTYPE WatchedGetParameter(
 
     OMX_ERRORTYPE err = (*original)(hComponent, nIndex, pParam);
 
+    /*
+     * What the component says it can decode, because the framework believes
+     * it over anything media_codecs.xml declares. MediaCodecList derives a
+     * maximum frame size from the level and intersects it with the XML
+     * limits, so the smaller wins: a component topping out at level 3.0 is
+     * held to 1620 macroblocks whatever the XML says, which passes 640x360
+     * at 900 and refuses 1280x720 at 3600. A decoder filtered out that way
+     * never reaches the caller at all, and software is what is left.
+     */
+    if (err == OMX_ErrorNone
+            && nIndex == OMX_IndexParamVideoProfileLevelQuerySupported
+            && pParam != NULL) {
+        const OMX_VIDEO_PARAM_PROFILELEVELTYPE *pl =
+                static_cast<const OMX_VIDEO_PARAM_PROFILELEVELTYPE *>(pParam);
+
+        ALOGE("advertises port %u entry %u: profile 0x%x level 0x%x",
+              pl->nPortIndex, pl->nProfileIndex, pl->eProfile, pl->eLevel);
+    }
+
     if (err != OMX_ErrorNone
             || nIndex != OMX_IndexParamPortDefinition || pParam == NULL) {
         return err;

@@ -343,6 +343,101 @@ void forgetComponent(OMX_COMPONENTTYPE *component) {
     gWatched.erase(it);
 }
 
+/*
+ * A change on the input port, kept from a caller that cannot take one.
+ *
+ * OMX.Nvidia.aac.decoder starts out set for two channels. Given a mono stream
+ * it says so twice, as OMX_EventPortSettingsChanged: once for its input port,
+ * naming OMX_IndexParamAudioAac, and straight after for its output port,
+ * naming OMX_IndexParamAudioPcm. Both read one channel by then. A stereo
+ * stream raises neither.
+ *
+ * The specification allows the first, but ACodec takes this event for the
+ * output port only and asserts on any other, which brings down the media
+ * server -- every video with a mono AAC soundtrack, the picture included.
+ * There is nothing in it for ACodec to act on anyway: the input port carries
+ * the stream ACodec itself describes, and what the change means for decoded
+ * audio is the second event, which ACodec handles by reading the output format
+ * again.
+ *
+ * So the input port's event stops here, written down, and the output port's
+ * goes on. Every other event and both buffer callbacks pass untouched, for
+ * every component, which is why all of them are routed through here and not
+ * just the one that was caught at it.
+ */
+
+struct Listener {
+    OMX_CALLBACKTYPE callbacks;
+    std::string name;
+    OMX_COMPONENTTYPE *component;
+};
+
+std::mutex gListenersLock;
+std::map<OMX_PTR, Listener> gListeners;
+
+bool listenerFor(OMX_PTR appData, Listener *listener) {
+    std::lock_guard<std::mutex> lock(gListenersLock);
+
+    std::map<OMX_PTR, Listener>::const_iterator it = gListeners.find(appData);
+
+    if (it == gListeners.end()) {
+        return false;
+    }
+
+    *listener = it->second;
+    return true;
+}
+
+OMX_ERRORTYPE ListenedEventHandler(
+        OMX_HANDLETYPE hComponent, OMX_PTR appData, OMX_EVENTTYPE eEvent,
+        OMX_U32 nData1, OMX_U32 nData2, OMX_PTR pEventData) {
+    Listener listener;
+
+    if (!listenerFor(appData, &listener)) {
+        ALOGE("event %d from a component this plugin does not know", eEvent);
+        return OMX_ErrorInvalidComponent;
+    }
+
+    if (eEvent == OMX_EventPortSettingsChanged && nData1 == 0) {
+        ALOGI("%s: settings of input port changed (index 0x%08x), "
+              "not passed on", listener.name.c_str(), nData2);
+        return OMX_ErrorNone;
+    }
+
+    return (*listener.callbacks.EventHandler)(
+            hComponent, appData, eEvent, nData1, nData2, pEventData);
+}
+
+OMX_ERRORTYPE ListenedEmptyBufferDone(
+        OMX_HANDLETYPE hComponent, OMX_PTR appData,
+        OMX_BUFFERHEADERTYPE *pBuffer) {
+    Listener listener;
+
+    if (!listenerFor(appData, &listener)) {
+        return OMX_ErrorInvalidComponent;
+    }
+
+    return (*listener.callbacks.EmptyBufferDone)(hComponent, appData, pBuffer);
+}
+
+OMX_ERRORTYPE ListenedFillBufferDone(
+        OMX_HANDLETYPE hComponent, OMX_PTR appData,
+        OMX_BUFFERHEADERTYPE *pBuffer) {
+    Listener listener;
+
+    if (!listenerFor(appData, &listener)) {
+        return OMX_ErrorInvalidComponent;
+    }
+
+    return (*listener.callbacks.FillBufferDone)(hComponent, appData, pBuffer);
+}
+
+OMX_CALLBACKTYPE gListenedCallbacks = {
+    ListenedEventHandler,
+    ListenedEmptyBufferDone,
+    ListenedFillBufferDone,
+};
+
 }  // namespace
 
 OMXPluginBase *createOMXPlugin() {
@@ -394,13 +489,28 @@ OMX_ERRORTYPE NVOMXPlugin::makeComponentInstance(
         return OMX_ErrorUndefined;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(gListenersLock);
+
+        Listener &listener = gListeners[appData];
+        listener.callbacks = *callbacks;
+        listener.name = name;
+        listener.component = NULL;
+    }
+
     OMX_ERRORTYPE err = (*mGetHandle)(
             reinterpret_cast<OMX_HANDLETYPE *>(component),
             const_cast<char *>(name),
-            appData, const_cast<OMX_CALLBACKTYPE *>(callbacks));
+            appData, &gListenedCallbacks);
 
     if (err == OMX_ErrorNone) {
         watchComponent(*component, name);
+
+        std::lock_guard<std::mutex> lock(gListenersLock);
+        gListeners[appData].component = *component;
+    } else {
+        std::lock_guard<std::mutex> lock(gListenersLock);
+        gListeners.erase(appData);
     }
 
     if (!strncmp(name, "OMX.Nvidia.drm.play", strlen("OMX.Nvidia.drm.play")))
@@ -424,7 +534,21 @@ OMX_ERRORTYPE NVOMXPlugin::destroyComponentInstance(
 
     forgetComponent(component);
 
-    return (*mFreeHandle)(reinterpret_cast<OMX_HANDLETYPE *>(component));
+    OMX_ERRORTYPE err =
+            (*mFreeHandle)(reinterpret_cast<OMX_HANDLETYPE *>(component));
+
+    /* Only after the component is gone: it may still report while it goes. */
+    std::lock_guard<std::mutex> lock(gListenersLock);
+
+    for (std::map<OMX_PTR, Listener>::iterator it = gListeners.begin();
+            it != gListeners.end(); ++it) {
+        if (it->second.component == component) {
+            gListeners.erase(it);
+            break;
+        }
+    }
+
+    return err;
 }
 
 OMX_ERRORTYPE NVOMXPlugin::enumerateComponents(

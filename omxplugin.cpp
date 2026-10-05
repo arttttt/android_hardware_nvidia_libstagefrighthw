@@ -156,10 +156,14 @@ bool isVideoOutputPort(const OMX_PARAM_PORTDEFINITIONTYPE *def) {
     return def->eDomain == OMX_PortDomainVideo && def->eDir == OMX_DirOutput;
 }
 
+/* A warning, not an error: a refusal is part of the bargaining. ACodec offers
+ * the output port a buffer count, takes no for an answer and offers the next,
+ * so one of these per video is expected. What was refused is still worth
+ * having when it is the last word. */
 void reportRefusedPortDefinition(
         OMX_ERRORTYPE err, const OMX_PARAM_PORTDEFINITIONTYPE *def) {
     if (def->eDomain != OMX_PortDomainVideo) {
-        ALOGE("port definition refused with 0x%08x: port %u, domain %d, "
+        ALOGW("port definition refused with 0x%08x: port %u, domain %d, "
               "buffers actual %u min %u size %u, enabled %d populated %d",
               err, def->nPortIndex, def->eDomain, def->nBufferCountActual,
               def->nBufferCountMin, def->nBufferSize,
@@ -167,7 +171,7 @@ void reportRefusedPortDefinition(
         return;
     }
 
-    ALOGE("port definition refused with 0x%08x: port %u %s, "
+    ALOGW("port definition refused with 0x%08x: port %u %s, "
           "buffers actual %u min %u align %u size %u, "
           "%ux%u stride %d slice %u, colour 0x%x compression 0x%x, "
           "enabled %d populated %d",
@@ -297,11 +301,10 @@ OMX_ERRORTYPE WatchedSetParameter(
         return err;
     }
 
+    /* Any other refusal is already logged by OMXNodeInstance, by name. */
     if (nIndex == OMX_IndexParamPortDefinition && pParam != NULL) {
         reportRefusedPortDefinition(
                 err, static_cast<const OMX_PARAM_PORTDEFINITIONTYPE *>(pParam));
-    } else {
-        ALOGE("SetParameter(0x%08x) refused with 0x%08x", nIndex, err);
     }
 
     return err;
